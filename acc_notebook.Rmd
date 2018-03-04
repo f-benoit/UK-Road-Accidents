@@ -1,0 +1,822 @@
+---
+title: 'UK Accident Data Wrasngling, Exploratory Data Analysis, Forecasting '
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+
+```{r setup, include=FALSE,echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(XLConnect)
+library(stringr)
+library(lubridate)
+library(chron)
+library(tidyr)
+library('scales')
+library(gridExtra)
+library(RColorBrewer)
+library("maps")
+library("viridis")
+library("mapproj")
+library("ggmap")
+library('SearchTrees')
+library("plotly")
+library(rmarkdown)
+library("forecast")
+library("tseries")
+```
+
+I have dowloaded the UK accident Dataset from [data.gov.uk here](https://data.gov.uk/dataset/road-accidents-safety-data), 
+I've dowloaded 10 years of historic from 2005 to 2014 for this notebook.
+There are three datasets:
+ - Accidents:CSv file, Main dataset, 1,6M records, contains information about date, time,day of the week, accident severity, location, weather, road type...
+ - Vehicles: CSV file, 3M records COntains information about vehicle type, driver age, driver sex, is vehicle rent...
+ - Casualties:CSV file, 2,2M records COntains information about
+ - Lookup: XLS file, All the data variables are coded rather than containing textual strings this lookup file contains all the code and text string associated 
+There is unique identifier "Accident_Index" to merge the three datasets, an accident can have more than one vehicle or more than casualty related to it
+
+Thourghout this notebook for performance reason I only used the Accidents and Vehicles datasets but I've also created the code to clean and merge casualties dataset if you wish to explore it, so feel free to fork my notebook, improve it and share your findings.
+
+
+## Data Wrangling
+Overall the files are pretty good apart from few missing data, so here the main tasks will be:
+ - Merge the datasets together
+ - Find a way to match variable code with lookup file which contains variable text string
+ - Add some new features to better explore the accident dataset
+
+
+#### Import files
+```{r }
+getwd()
+setwd("H:\\R Projetcs\\UK_Accident")
+Accidents<-fread("Accidents0514.csv",header = TRUE,sep = ",")
+#Casualties<-fread("Casualties0514.csv",header = TRUE,sep = ",")
+Vehicles<-fread("Vehicles0514.csv",header = TRUE,sep = ",")
+#Ope the excel file
+wb <- loadWorkbook('Road-Accident-Safety-Data-Guide.xls')
+#get worksheet names
+wsht <- getSheets(wb)
+#remove first two worksheets
+wsht<-wsht[-c(1,2)]
+#create my mapping df
+mapping <- data.frame( Code=character(), Label=character(),Variable=character(), stringsAsFactors=FALSE)
+#loop through each worksheet and insert sheetname, code and label into the mapping df
+for (ws in wsht) {
+  dat <- readWorksheet(wb, ws)
+  #replace spaces by "_"
+  dat$Variable<-str_replace_all(ws, fixed(" "), "_")
+  colnames(dat) <- c("Code","Label","Variable")
+  mapping<-rbind(mapping,dat)
+}
+mapping<-mapping[c("Variable", "Code", "Label")]
+
+
+
+```
+
+### Rename Columns 
+In order to match the dataset variables with the lookup df, we need to have the same column names so here I have to rename some columns manually.
+In addition, as R is case sensitive we need to make sure all our columns are lower cases.
+
+```{r , echo=TRUE}
+#Casualties
+rename.caslts.cols<-function(){
+   #lower case all column names
+  names(Casualties)[0:length(Casualties)] <- tolower(names(Casualties)[0:length(Casualties)])
+  #bus_passenger
+  setnames(Casualties, "bus_or_coach_passenger", "bus_passenger")
+  #ped_location
+  setnames(Casualties,"pedestrian_location", "ped_location")
+  #ped_movement
+  setnames(Casualties,"pedestrian_movement", "ped_movement")
+  #ped_road_maintenance_worker
+  setnames(Casualties,"pedestrian_road_maintenance_worker", "ped_road_maintenance_worker")
+}
+#Vehicles
+#rename.veh.cols<-function(){
+  #lower case all column names
+  names(Vehicles)[0:length(Vehicles)] <- tolower(names(Vehicles)[0:length(Vehicles)])
+  #journey_purpose
+  setnames(Vehicles, "journey_purpose_of_driver", "journey_purpose")
+  #propulsion_code
+  setnames(Vehicles,"propulsion_code", "vehicle_propulsion_code")
+  #veh_leaving_carriageway
+  setnames(Vehicles,"vehicle_leaving_carriageway", "veh_leaving_carriageway")
+  #vehicle_location
+  setnames(Vehicles,"vehicle_location-restricted_lane", "vehicle_location")
+
+
+#}
+#Accident 
+#rename.acc.cols<-function(){
+  #lower case all column names
+  names(Accidents)[0:length(Accidents)] <- tolower(names(Accidents)[0:length(Accidents)])
+  #police_officer_attend
+  setnames(Accidents,"did_police_officer_attend_scene_of_accident", "police_officer_attend")
+  #ped_cross_-_human
+  setnames(Accidents, "pedestrian_crossing-human_control", "ped_cross_human")
+  #ped_cross_-_physical
+  setnames(Accidents,"pedestrian_crossing-physical_facilities", "ped_cross_facilities")
+  #road_surface
+  setnames(Accidents,"road_surface_conditions", "road_surface")
+  #urban_rural
+  setnames(Accidents,"urban_or_rural_area", "urban_rural")
+  #weather
+  setnames(Accidents,"weather_conditions", "weather")
+#}
+#mapping 
+#rename.map.cols<-function(){
+  #lower case all column names
+  mapping$Variable<-tolower(mapping$Variable)
+  #age_band
+  mapping$Variable<-ifelse(mapping$Variable=="age_band","age_band_of_driver",mapping$Variable)
+  #Remove age_of_casualty
+  mapping<-mapping[mapping$Variable!="age_of_casualty",]
+  #home_area_type
+  mapping$Variable<-ifelse(mapping$Variable=="home_area_type","driver_home_area_type",mapping$Variable)
+  #imd_decile
+  mapping$Variable<-ifelse(mapping$Variable=="imd_decile","driver_imd_decile",mapping$Variable)
+  #ped_cross_-_human
+  mapping$Variable<-ifelse(mapping$Variable=="ped_cross_-_human","ped_cross_human",mapping$Variable)
+  #ped_cross_-_physical
+  mapping$Variable<-ifelse(mapping$Variable=="ped_cross_-_physical","ped_cross_facilities",mapping$Variable)
+  #was_vehicle_left_hand_drive
+  mapping$Variable<-ifelse(mapping$Variable=="was_vehicle_left_hand_drive","left_hand_drive",mapping$Variable)
+#}
+
+
+
+
+```
+
+### Merge the datasets together
+```{r}
+#Create a function to merge my df
+merge.all<- function(x, y) {
+ merge(x, y, all=TRUE, by=listCols)
+}
+#Lits of columns to merge on
+listCols<-c(colnames(Accidents)[1])#only the first col in this case
+#call the merge function
+acc.uk<- Reduce(merge.all, list(Accidents,Vehicles))
+#free memeory
+rm(Vehicles)
+#rm(Casualties)
+rm(Accidents)
+#show the final dataset
+str(acc.uk)
+
+```
+### Maping variables
+In order to make sure all my column names match with the variable names in the lookup df, I've created a mapping function to return the matching column (True) or to return the columns that are not matching (False)
+#### Function to return mapepd or unmapped columns
+```{r , echo=FALSE}
+
+#function to check mapping
+check.mapping<- function(src, target,macth=FALSE) {
+   if(macth==FALSE)  return(sort(src[!c(src%in% target)]))
+   if(macth==TRUE)  return(sort(src[c(src%in% target)]))
+}
+```
+
+### Map the mapping table with the main dataset
+I have created a function, which loops through only the variable associated with a column of our dataset.
+(The mapping contains also the Vehicle variable, using our previous mapping function we can exclude those variables then)
+```{r}
+#Get only the columns that can be mapped with the variables in the lookup dataframe
+mapp.cols<-check.mapping(unique(mapping$Variable),colnames(acc.uk),TRUE)
+#take a wile
+for (col in mapp.cols) {
+  temp<-mapping[mapping$Variable==col,]
+  acc.uk[[col]]<-temp$Label[ match(acc.uk[[col]],temp$Code)]
+}
+str(acc.uk)
+
+```
+
+
+#### Check columns Unique Elements
+This function below returns the number of unique elements we have for each variable hence make it easier to identify which variable can be seen as factors
+```{r}
+
+fact.cols<-sapply(acc.uk[,mapp.cols, with=FALSE], function(x) length(unique(x)))
+sort(fact.cols,decreasing = TRUE)
+```
+Most of the algorithms will perform better if you explicitly declare the variable as factors so you can uncomment those two chunks below but you'll need good computational resources.
+And more specifically for ordinal factors or numeric variable that are actually not numeric but factors.
+In this case below I convert all the variable with less than 25 unique elements to factor, however it'll be too slow to run this part on my notebook so you'll need good computation resource to run it.
+
+```{r}
+#mapp.fact.cols<-mapp.cols[fact.cols<25]
+#acc.uk[mapp.fact.cols] <- lapply(acc.uk[mapp.fact.cols], factor)
+```
+
+### Add New Features
+I've added a bunch of new features such as Year, Month, Week and time_slot.
+Those features will be crucial to make deeper exploratory analysis.
+```{r}
+#date conversion
+acc.uk$newDate<- as.Date(acc.uk$date, "%d/%m/%Y")
+#extract year
+acc.uk$year<-year(acc.uk$newDate)
+#extract month
+acc.uk$month<-as.factor(month(acc.uk$newDate))
+#extract week of  year
+acc.uk$week<-as.factor(week(acc.uk$newDate))
+#extract day of year
+acc.uk$day<-yday(acc.uk$newDate)
+# time slot
+acc.uk$time_slot <-as.numeric(substr(acc.uk$time,0,2))
+#extract week-end night starting 2200 to 0600 on the week-end days
+acc.uk$day_of_week<-factor(acc.uk$day_of_week)
+```
+### Remove not needed columns
+I know there are few columns I won't need for my analysis so removing them will just make my dataframe size smaller and then faster to explore
+#### check NA first
+Check if there is any variable is a large amount of NAs.
+```{r}
+sort(sapply(acc.uk, function(x) sum(is.na(x))),decreasing = TRUE)
+```
+
+
+```{r}
+acc.uk$`2nd_road_class`<-NULL
+acc.uk$date<-NULL
+acc.uk$police_officer_attend<-NULL
+acc.uk$vehicle_propulsion_code<-NULL
+```
+
+## Explanatory Data Analysis
+Throughout this analysis I'll to analyze the impact of different variables on the number of Accidents and accidents severity
+There's a lot of variables to explore but I will mainly focus my analysis on the following variables:
+ - Day
+ - Time
+ - Weather
+ - JUnction Type
+ - Area Type
+ - Age of Driver
+
+
+### Accident by days
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(day_of_week) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=day_of_week, y=total_accidents)) +
+    geom_bar(stat="identity", fill="steelblue")+
+    geom_text(aes(label=total_accidents), vjust=1.6, color="white", size=3.5)+
+    theme_minimal()
+```
+### Accident by hours
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(time_slot) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=time_slot, y=total_accidents)) +
+    geom_bar(stat="identity", fill="steelblue")+
+    geom_text(aes(label=total_accidents), vjust=1.6, color="black", size=3)+
+    scale_x_continuous(breaks = round(seq(0, 24, by = 2),0)) +
+    ggtitle("Total Accidents by Hours from 2005 to 2014") +
+    xlab("Hours") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank())
+    
+```
+
+We observe that accidents tend to occur on the business hours when people commute to work.
+But now let's dive into it.
+Are the accident severity similarly distributed?
+
+
+#### Slight Accident by hours
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  filter(accident_severity=="Slight")%>%
+  group_by(time_slot) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=time_slot, y=total_accidents)) +
+    geom_bar(stat="identity", fill="steelblue")+
+    geom_text(aes(label=total_accidents), vjust=1.6, color="black", size=3)+
+    scale_x_continuous(breaks = round(seq(0, 24, by = 2),0)) +
+    ggtitle("Total Slight Accidents by Hours from 2005 to 2014") +
+    xlab("Hours") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank())
+    
+```
+
+#### Serious Accidents by hours
+```{r fig.height = 5, fig.width = 10}
+
+acc.uk %>% 
+  filter(accident_severity=="Serious")%>%
+  group_by(time_slot) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=time_slot, y=total_accidents)) +
+    geom_bar(stat="identity", fill="steelblue")+
+    geom_text(aes(label=total_accidents), vjust=1.6, color="black", size=3)+
+    scale_x_continuous(breaks = round(seq(0, 24, by = 2),0)) +
+    ggtitle("Total Serious Accidents by Hours from 2005 to 2014") +
+    xlab("Hours") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank())
+```
+
+#### Fatal Accidents by hours
+```{r fig.height = 5, fig.width = 10}
+
+acc.uk %>% 
+  filter(accident_severity=="Fatal")%>%
+  group_by(time_slot) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=time_slot, y=total_accidents)) +
+    geom_bar(stat="identity", fill="steelblue")+
+    geom_text(aes(label=total_accidents), vjust=1.6, color="black", size=3)+
+    scale_x_continuous(breaks = round(seq(0, 24, by = 2),0)) +
+    ggtitle("Total Fatal Accidents by Hours from 2005 to 2014") +
+    xlab("Hours") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank())
+```
+
+### Contingency Table
+In statistics, a contingency table is a type of table in a matrix format that displays the frequency distribution of the variables.
+They are heavily used in survey research, business intelligence, engineering and scientific research. 
+They provide a basic picture of the interrelation between two variables and can help find interactions between them.
+More about [Contingency Table here](https://en.wikipedia.org/wiki/Contingency_table).
+
+#### Row Percentages 
+In the example below, I generate a contingency table and then compute row percentage, which means the value of each cell is divided by the sum of the row cells.  
+```{r}
+acc.time.severity<-table(acc.uk$time_slot,acc.uk$accident_severity)
+prop.table(acc.time.severity,1)
+```
+Looking at the proportion table it seems that the hour when the accident occurs has an impact on the accident severity.
+We can observe that during the night the proportion of fatal accidents is higher than during the day
+while we observe the opposite result for the slight accidents.
+We will verify later if we can prove our conclusion using chi-square test.
+
+### Accident Severity during Weekend night
+#### Add the feature week-end night variable 
+Weekend_night take the value Yes if it's Friday or Saturday night (from 10pm till 06am)
+```{r fig.height = 5, fig.width = 10}
+acc.uk$Week_end_night<-ifelse((acc.uk$day_of_week=="Friday" & acc.uk$time_slot %in% c(22:23)) | 
+                                acc.uk$day_of_week=="Saturday" & acc.uk$time_slot %in% c(22:23,0:6) |
+                                  acc.uk$day_of_week=="Sunday" & acc.uk$time_slot %in% c(0:6),"Yes","No") 
+
+```
+### Accident Severity Proportion WE-Night vs non WE-Night
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(Week_end_night,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+  mutate(freq = percent(total_accidents / sum(total_accidents))) %>%
+    ggplot(aes(x=accident_severity, y=freq,fill=Week_end_night)) +
+    geom_bar(stat="identity", position="dodge")+
+    geom_text(aes(label=freq), vjust=1.6, color="black", size=3)+
+    ggtitle("Accident Severity Proportion WE-Night vs non WE-Night") +
+    xlab("Accident Severity") + ylab("Accident Proportion")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank())
+```
+We can clearly see a massive difference between the proportion of fatal accident during the week-end night hours and non week-end night hours.
+Let's verifiy it with the chi-square test again
+
+
+So far we discovered that there's more accidents during the rush hour time (4pm-6pm) across all accident severity level.
+However we found out that the probability of an accident to be fatal is higher during the weekend night.
+
+Let's now investigate other variables such as:
+ - Weather
+ - Area Type
+ - Junction Type
+ - Age of Driver
+
+### Accident Severity by Weather COndition
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(weather,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=accident_severity, y=total_accidents,fill=weather)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity by Weather Condition") +
+    xlab("Accident Severity") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+### Accident Severity Proportion by Weather COndition
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(weather,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+  mutate(freq = percent(total_accidents / sum(total_accidents))) %>%
+    ggplot(aes(x=accident_severity, y=freq,fill=weather)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity Proportion by Weather") +
+    xlab("Accident Severity") + ylab("Accident Proportion")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),
+          axis.text.y=element_blank(),axis.ticks.y=element_blank())
+
+
+```
+
+I have removed the Y-axis as tehre's too many variables it won't be readable but the conclusion we can make from this chart is that
+probability of an accident to be fatal is higher when it's foggy or misty.
+
+### Accident Severity by Area Type
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  filter(urban_rural!="Unallocated")%>%
+  group_by(urban_rural,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=accident_severity, y=total_accidents,fill=urban_rural)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity by Area Type") +
+    xlab("Accident Severity") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+### Accident Severity Proportion by Area Type
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(urban_rural,accident_severity) %>%   
+    filter(urban_rural!="Unallocated")%>%
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+  mutate(freq = percent(total_accidents / sum(total_accidents))) %>%
+    ggplot(aes(x=accident_severity, y=freq,fill=urban_rural)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity Proportion by Area Type") +
+    xlab("Accident Severity") + ylab("Accident Severity Proportion")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),
+          axis.ticks.y=element_blank())
+```
+
+### Accident Severity by Junction Type
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(junction_detail,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=accident_severity, y=total_accidents,fill=junction_detail)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity by Junction Type") +
+    xlab("Accident Severity") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Accident Severity Proportion by Junction Type
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(junction_detail,accident_severity) %>%   
+    filter(junction_detail!="Data missing or out of range")%>%
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+  mutate(freq = percent(total_accidents / sum(total_accidents))) %>%
+    ggplot(aes(x=accident_severity, y=freq,fill=junction_detail)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity Proportion by Junction Type") +
+    xlab("Accident Severity") + ylab("Accident Severity Proportion")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),
+          axis.ticks.y=element_blank())
+```
+We can see that the probability of an accident to be fatal is higher on road that ar enot a junction or within 20 metres of a junction.
+On the contrary an accident happening on a roundabout is much more likely to be a slight accident and not likely at all to be a fatal accident.
+
+Why I removed the rows labelled as "Data missing or out of range"?
+There's only 26 rows with missing information over million rows so it is safe to remove them.
+And also as we can see in the below frquency table the proportion of the fatal accident for "Data missing or out of range" would be missleading in our plot 5/26~19% while the second highest proportion is just 3%.
+```{r}
+tt<-table(acc.uk$junction_detail,acc.uk$accident_severity)
+prop.table(tt,1)
+```
+
+### Accident Severity by Age of Drivers
+```{r fig.height = 5, fig.width = 10}
+
+acc.uk %>% 
+  group_by(age_band_of_driver,accident_severity) %>% 
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+    ggplot(aes(x=accident_severity, y=total_accidents,fill=age_band_of_driver)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident by Age of Drivers") +
+    xlab("Accident Severity") + ylab("Total Accidents")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+So it looks like the most dangerous drivers or those who cause the highest amount of accidents are the young drivers.
+Now we want to find out the proportion of fatal accident among each age brand.
+
+### Accident Severity Proportion by Age of Driver
+```{r fig.height = 5, fig.width = 10}
+acc.uk %>% 
+  group_by(age_band_of_driver,accident_severity) %>%   
+  summarize(total_accidents=n_distinct(accident_index)) %>%
+  mutate(freq = percent(total_accidents / sum(total_accidents))) %>%
+    ggplot(aes(x=accident_severity, y=freq,fill=age_band_of_driver)) +
+    geom_bar(stat="identity", position="dodge")+
+    ggtitle("Accident Severity Proportion by Age of Driver") +
+    xlab("Accident Severity") + ylab("Accident Severity Proportion")+
+    theme(plot.title = element_text(hjust = 0.5), panel.background = element_blank(),
+          axis.ticks.y=element_blank())
+
+```
+It turns out that the death rate of drivers aged over 75 is much higher probably because they are more vulnerable to injuries?
+ - Over 75: 2.6%
+ - 66 - 75: 1.7%
+ - 56 - 65: 1.6%
+ - 46 - 55: 1.5%
+ - 36 - 45: 1.3%
+ - 26 - 35: 1.2%
+ - 21 - 25: 1.3%
+ 
+A deeper analysis could be to explore what type of car they drive? Do elderly driver older car hence less safe? Where do they have accidents junction, intersection?
+
+
+### HeatMap Weekday vs Hours
+Heatmap is a nice way to illustrate the relation betwwen accident severity accross Days and Hours.
+Accident Severity from left to right: Slight, Serious, Fatal
+Again we clearly observe that the amount of fatal accidents increases at night especially during the week-end 
+```{r fig.height = 5, fig.width = 10}
+acc.hour.day.slight<-as.matrix(table(acc.uk$time_slot[acc.uk$accident_severity=="Slight"],acc.uk$day_of_week[acc.uk$accident_severity=="Slight"]))
+acc.hour.day.serious<-as.matrix(table(acc.uk$time_slot[acc.uk$accident_severity=="Serious"],acc.uk$day_of_week[acc.uk$accident_severity=="Serious"]))
+acc.hour.day.fatal<-as.matrix(table(acc.uk$time_slot[acc.uk$accident_severity=="Fatal"],acc.uk$day_of_week[acc.uk$accident_severity=="Fatal"]))
+coul = rev(colorRampPalette(brewer.pal(8, "PiYG"))(25))
+par(mfrow=c(1,3))
+{
+nba_heatmap <- heatmap(acc.hour.day.slight, Rowv=NA, Colv=NA, col = coul, scale="column", margins=c(5,10))  
+nba_heatmap <- heatmap(acc.hour.day.serious, Rowv=NA, Colv=NA, col = coul, scale="column", margins=c(5,10))  
+nba_heatmap <- heatmap(acc.hour.day.fatal, Rowv=NA, Colv=NA, col = coul, scale="column", margins=c(5,10))  
+}
+```
+
+### Interactive Map: Ratio Accidents by City Population
+```{r}
+UK <- map_data("world") %>% filter(region=="UK")
+data=world.cities %>% filter(country.etc=="UK")
+tree<- createTree(data,columns=c(4,5)) #columns is the number of columns with latitude and longitude
+acc.map.uk<-acc.uk %>% 
+  filter(accident_severity=="Fatal")%>%
+  group_by(longitude,latitude) %>% 
+  summarize(total_fatal_accidents=n_distinct(accident_index))
+#K-nearest neighboor lookup
+#All the accidents will be mapped to the nearest city based on the long/lat values
+acc.map.uk$city.idx<-knnLookup(tree,acc.map.uk$latitude,acc.map.uk$longitude,k=1)
+acc.map.uk<- acc.map.uk %>%
+              group_by(city.idx) %>% 
+              summarize(total_fatal_accidents=sum(total_fatal_accidents))
+acc.map.uk$city<-data$name[acc.map.uk$city.idx]
+acc.map.uk$pop<-data$pop[acc.map.uk$city.idx]
+acc.map.uk$lat<-data$lat[acc.map.uk$city.idx]
+acc.map.uk$long<-data$long[acc.map.uk$city.idx]
+acc.map.uk$ratio.acc<-round((acc.map.uk$total_fatal_accidents/acc.map.uk$pop)/10,6)
+p=acc.map.uk %>%
+  arrange(ratio.acc) %>%
+  mutate( city=factor(city, unique(city))) %>%
+  mutate( mytext=paste("City: ", city, "\n", "Fatal Accidents: ", total_fatal_accidents,
+                       "\n", "Population: ", pop,
+                          "\n", "Ratio Fatal Accidents/Pop: ", ratio.acc,sep="")) %>%  
+  ggplot() +
+    geom_polygon(data = UK, aes(x=long, y = lat, group = group), fill="grey", alpha=0.3) +
+    geom_point(aes(x=long, y=lat, size=ratio.acc, color=ratio.acc, text=mytext, alpha=ratio.acc) ) +
+    scale_size_continuous(range=c(1,7)) +
+    scale_color_viridis(option="inferno" ) +
+    scale_alpha_continuous() +
+    theme_void() +
+    ylim(50,59) +
+    coord_map() +
+    theme()
+ 
+p=ggplotly(p, tooltip="text")
+ p
+```
+
+k-nearest neighbours is great for the areas with many cities however, for the large rural area such as Scotland, it's not that good.
+In fact, there is a very wide rural area around Fort William and this means that all the accidents in the north-west of Scotland will be counted for Fort William, which is a sort of biased result.
+A better approach could be to get the counties boundaries and map them with our current dataset and then apportionate the total accidents with the county's population.
+I would still expect Fort William to have a high ratio, as it is a major tourist centre with a small population.
+
+
+There is still much more explanatory analysis to be done, you can for example add the Casualties dataset or explore new variables taht I ahven't explored so far.
+Overall wer learnt that:
+ - Weather with highes death rate is foggy or misty
+ - Friday and Saturday night have the highest death rate
+ - Death rate in rural area is higher than urban area
+ - Roundabout have the lowest death rate while accident on road (not a junction or within 20 metres) have the highest death rate
+ - Drivers aged over 75 due to the fact they are more vulnerable to injuries? Maybe we'll need to make further analysis to confirm this assumption
+ - Most of the accidents occur occur during rushhour time (especially evening)
+ - Young driver have more car accidents
+
+
+
+## Inferential Statistics
+### Chi-squared test 
+For 2-way tables we can use CHi-sqaure to test the independence of the row and column variable. 
+More about [Chi-squared test here](https://en.wikipedia.org/wiki/Chi-squared_distribution)
+#### Test of Independence: Accident Severity vs Hours
+The Null hypothesis states that Accident Severity is independant of the hours variabes.
+```{r}
+chisq.test(acc.time.severity) 
+```
+As the p-value is significantly less than 0.05, we reject with the Null hypothesis that the accident severity is independent of the hours.
+#### Test of Independence: Accident Severity vs Weekend night 
+```{r}
+acc.we.night.severity<-table(acc.uk$Week_end_night,acc.uk$accident_severity)
+chisq.test(acc.we.night.severity) 
+```
+Again we reject with the Null hypothesis that the accident severity is independent of Weekend night hours.
+#### Test of Independence: Accident Severity vs Weather, Area Type and Junction Type
+```{r,echo=FALSE}
+acc.weather.severity<-table(acc.uk$weather,acc.uk$accident_severity)
+acc.area.severity<-table(acc.uk$urban_rural,acc.uk$accident_severity)
+acc.junction.severity<-table(acc.uk$junction_detail,acc.uk$accident_severity)
+chisq.test(acc.weather.severity)
+chisq.test(acc.area.severity)
+chisq.test(acc.junction.severity)
+```
+All our previous finindings are with 95% CI statistically correct as we always have a p-value < 0.05
+
+### Two-Samples T Tests
+#### Testing a Hypothesis for Independent Samples: Accident Fatal Ratio Driver Age >75 vs Driver Age <75
+```{r fig.height = 5, fig.width = 10}
+options(scipen=999)
+#Let's create two new features: is accident fatal is driver over 75
+acc.uk$driver.over.75<-ifelse(acc.uk$age_band_of_driver=="Over 75","Yes","No")
+acc.uk$is.fatal<-ifelse(acc.uk$accident_severity=="Fatal",1,0)
+
+
+acc.fatal.less.75<- replicate(200,mean(sample(acc.uk$is.fatal[acc.uk$driver.over.75=="No"],10000)))
+acc.fatal.over.75<-replicate(200,mean(sample(acc.uk$is.fatal[acc.uk$driver.over.75=="Yes"],10000)))
+par( mfrow = c( 1, 2 ) )
+{
+hist(acc.fatal.less.75 ,main="Accident Fatal Ratio Driver Age under 75", 
+     xlab="Accident Fatals Ratio" )
+hist(acc.fatal.over.75,main="Accident Fatal Ratio Driver Age over 75", 
+     xlab="Accident Fatals Ratio" )
+}
+```
+The conditions for the t-test are:
+ - The data were collected in a random way
+ - Each observation must be independent of the others
+ - The sampling distribution must be normal or approximately normal
+ - Variance of my samples are equal (Pooled Variance) if not equal (Unpooled Variance)  
+   Unpooled Variance is also called welsh t-test
+   
+Looking at the dirstribution of out two sample means we can carry on with out t-test
+
+
+```{r fig.height = 5, fig.width = 10}
+options(scipen=999)
+var.over.75<-var(acc.fatal.over.75)
+var.under.75<-var(acc.fatal.less.75)
+(var.over.75  - var.under.75)/var.over.75* 100
+#The variances are not equal at all so R should automatically choose the Welsh t-test
+t.test(acc.fatal.less.75,acc.fatal.over.75,paired = FALSE)
+```
+The p-value is nearly equal to zero so this is a strong evidence that the age of driver has an impact on accident death rate
+
+Using different statistic Tests we have then proved that all our assumption made during the explanatory part analysis were correct.
+
+
+
+
+## Forecasting
+### Time Series with daily Seasonal periods
+```{r fig.height = 5, fig.width = 10}
+acc.uk$first.day.month <- ymd(format(acc.uk$newDate, "%Y-%m-01"))
+acc.aggr<-acc.uk %>%  
+            filter(accident_severity=="Fatal")%>%
+            group_by(newDate,month,year) %>%
+            summarize(total_accidents=n_distinct(accident_index))
+startDate<-min(acc.aggr$newDate)
+endDate<-max(acc.aggr$newDate)
+acc.ts<- msts(acc.aggr$total_accidents,seasonal.periods   = 365.25,start = decimal_date(as.Date(startDate)))
+plot(acc.ts, main="Daily Fatal Accidents", xlab="Year", ylab="Accidents")
+```
+### Accident DIstrbution
+```{r}
+hist(acc.aggr$total_accidents,main="Frequency of Daily Accidents")
+```
+The daily amount of accidents is right skewed.
+### Year Variance
+```{r}
+{
+boxplot(acc.aggr$total_accidents~acc.aggr$year)
+means <- tapply(acc.aggr$total_accidents,acc.aggr$year,mean)
+points(means,col="red",pch=18)
+abline(h=mean(acc.aggr$total_accidents),col="red")
+abline(h=(mean(acc.aggr$total_accidents)+c(1,-1)*sd(acc.aggr$total_accidents)),col="blue",lty=2)
+legend(9,0.95*max(acc.aggr$total_accidents), legend=c("Mean", "SD"),col=c("red", "blue"), lty=1:2, cex=0.8)
+}
+
+```
+Overall the number of accidents tends to decrease from 2005 to 2013 but then slightly increased again for 2014.
+There's few outliers and overall all the years seem to be right skewed
+### Month Variance
+
+```{r}
+{
+boxplot(acc.aggr$total_accidents~acc.aggr$month)
+means <- tapply(acc.aggr$total_accidents,acc.aggr$month,mean)
+points(means,col="red",pch=18)
+abline(h=mean(acc.aggr$total_accidents),col="red")
+abline(h=(mean(acc.aggr$total_accidents)+c(1,-1)*sd(acc.aggr$total_accidents)),col="blue",lty=2)
+legend(1,0.95*max(acc.aggr$total_accidents), legend=c("Mean", "SD"),col=c("red", "blue"), lty=1:2, cex=0.8)
+}
+```
+The trend between months seems to remain approximately constant however most of them are right skewed
+
+```{r}
+{
+  qqnorm(acc.ts)
+  qqline(acc.ts)
+}
+```
+As already observed our data are right skewed
+
+```{r}
+acc.ts.components <- decompose(acc.ts)
+plot(acc.ts.components)
+```
+From the ST decomposition we observe that from 2007 to 2009 the trend the decrease rapidly and then slightly decrease from 2009 to 2013 and finally become stagnant from 2013 to 2014.
+There is an obvious seasonality accross the years with some spikes.
+Hoewever our time series seems to be still quite random.
+
+
+### Training/Testing Dataset
+```{r}
+my.dates<-acc.aggr$newDate
+nRows<-length(acc.aggr$newDate)
+tr  = window(acc.ts, start=c(decimal_date(as.Date(my.dates[1]))), end=c(decimal_date(as.Date(my.dates[nRows-365]))))
+tst = window(acc.ts, start=decimal_date(as.Date(my.dates[nRows-365])), end=decimal_date(as.Date(my.dates[nRows])))
+```
+
+### Train Different FOrecasting Models
+```{r}
+models <- list(
+"arima.fit"=auto.arima(tr, stepwise=TRUE, approximation=FALSE),
+"stlf.fit"=stlf(tr),
+"HW.fit"=HoltWinters(tr),
+"tbats.fit"=tbats(tr),
+"stl.fit"=stlm(tr,  ic='aicc', robust=TRUE, method='ets'),
+"neural.fit"=nnetar(tr)
+)
+
+forecasts <- lapply(models, forecast, 365)
+forecasts$naive <- naive(tr, 365)
+for(f in forecasts){
+  plot(f)
+  lines(tst, col='red')
+}
+```
+
+### Model Evaluation
+```{r}
+acc <- lapply(forecasts, function(f){
+  accuracy(f, tst)[2,,drop=FALSE]
+})
+acc <- Reduce(rbind, acc)
+row.names(acc) <- names(forecasts)
+acc <- acc[order(acc[,'MASE']),]
+round(acc, 2)
+```
+
+
+
+### Linear Model
+I want to see where mi linear model sit between the previous forecasting method
+```{r fig.height = 5, fig.width = 10}
+acc.aggr2<-acc.uk %>%  
+            filter(accident_severity=="Fatal")%>%
+            group_by( newDate ,day,day_of_week, week,month,year) %>%
+            summarize(total_accidents=n_distinct(accident_index))
+tr2<-acc.aggr2[acc.aggr2$newDate<"2014-01-01",]
+tst2<-acc.aggr2[acc.aggr2$newDate>="2014-01-01",]
+lm.fit<-lm(total_accidents~.-newDate,data=tr2)
+lm.fr<-predict(lm.fit,tst2)
+df.tst2 <- as.data.frame(cbind(tst2$newDate ,tst2$total_accidents, lm.fr))
+mse <- mean((tst2$total_accidents - lm.fr)^2)
+rmse<- sqrt(mse)
+{
+plot(df.tst2$V2,type="o")
+lines(df.tst2$lm.fr, type = "o", col = "blue")
+mtext(paste("RMSE of the linear model:",rmse), side=3)
+}
+```
+
+
+### Forecast vs Test
+```{r}
+tbats.fit=tbats(tr, ic='aicc')
+tbats.fr<-forecast(tbats.fit, h=365)
+X2 <- cbind(tbats.fr$mean)
+df.tst <- cbind(tst, forecasts$tbats.fit$mean)
+colnames(df.tst) <- c("Testing Data","tbats Forecast")
+autoplot(df.tst)+ theme_bw() +xlab("Year") + ylab(expression("Accidents"))+ ggtitle("Testing Data vs Forecasted Data")+ theme(plot.title = element_text(hjust = 0.5))
+```
+Overall we're not forecasting very well, the lowest RMSE we've got is 2.37 which is still a bit high as the range of the daily accident amount is 0 to 15.
+But if yoiu remember the decomposition of our time series contained a lot of randomness so this obviously difficult to predict anything which is random.
+
+
+I haven't developped the forecasting part a lot, so I may add some content soon.
+We could also predict wether an accident was fatal or not using classification model such as the famous titanic but as we've got lot more rows and features it would be interesting to see if we cann add even more features and them come up with classification model such xgboost tree, random forest, nnet.
